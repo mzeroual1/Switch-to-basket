@@ -1,0 +1,122 @@
+import rdws as rd
+import webpricer as wp
+import datetime as dt
+from typing import List
+import pandas as pd
+from scipy.interpolate import InterpolatedUnivariateSpline
+
+# autocall_methodo_sgithub_path = r'https://sgithub.fr.world.socgen/ilepoutr120814/pricing/blob/master/pricing2/methodo/autocall_methodo.py'
+autocall_methodo_sgithub_path = r'https://sgithub.fr.world.socgen/MarkEngPri/webpricer-equity-pricing-methods/blob/master/MethodoMere.py'
+
+AutocallPricingMethod = wp.load_pricing_method(autocall_methodo_sgithub_path)
+autocall_methodo = wp.load_code(autocall_methodo_sgithub_path)
+
+
+class CustomOutputPG(AutocallPricingMethod):
+    def finalize(self, params, details) -> wp.PricerResult:
+        # get the default result from generic autocall method
+        result = super().finalize(params, details)
+
+        # start creating a new one from all pricing details available in result.
+        prices = details.prices
+
+        if params.fugit:
+            fugit = prices['ST fwd Ref'].price.greeks.fugit / 365.
+            result.price_details['Fugit in years'] = fugit
+        else:
+            fugit = None
+
+        greeks = {}
+        for index, sensi in details.fees.items():
+            if 'Delta' in index or 'Vega' in index:
+                greeks[index] = sensi
+
+        # setup output views
+        result.access_rights.sales = []
+        result.access_rights.engineer = result.access_rights.engineer.append('Fugit in years')
+        return result
+
+    async def finalize_solving(self, product, params, solver_result: wp.SolverResult) -> wp.PricerResult:
+        
+        RunsDePrix = dict(zip(solver_result.x_vector, solver_result.y_vector))
+
+        if (len(solver_result.out_values) == 0 ):
+
+            s = InterpolatedUnivariateSpline(solver_result.y_vector, solver_result.x_vector, k=1)
+            x2try = s(product.target_price * 100)
+
+            if product.target_price * 100 > max(solver_result.y_vector):
+                output = 'You price can be improved, please try above :'+str(x2try)+' (assuming linear interp)'
+            elif product.target_price * 100 < min(solver_result.y_vector):
+                output = 'Your price is too expensive, please try below :'+str(x2try)+' (assuming linear interp)'
+
+
+            result = solver_result.prices[solver_result.x_vector[0]].clone(price=output)
+            for i in RunsDePrix:
+                print(i)
+                result.price_details['SolvedCoupon ' + str(i)] = RunsDePrix[i]
+
+                eng_rights = result.price_details.keys()
+                result.access_rights.engineer = eng_rights
+
+
+        else:
+            sol = solver_result.in_values[0] * 100
+            output = 'Solved ' + solver_result.params.product_param_name + ': ' + str(round(sol, 2)) + '%'
+
+            new_product = product.copy()
+            setattr(new_product, solver_result.params.product_param_name, solver_result.in_values[0])
+            setattr(new_product, "solve_for", 'Trading_Offer')
+
+            result = await self.price(new_product, params)
+
+            result.price_details["FullPriceRecomputed"] = result.price
+            result.price = output +'With Price :' +str(round(result.price, 2))
+
+            print(RunsDePrix)
+
+            for i in RunsDePrix:
+                print(i)
+                result.price_details['SolvedValue ' + str(i)] = RunsDePrix[i]
+
+                eng_rights = result.price_details.keys()
+                result.access_rights.engineer = eng_rights
+                result.access_rights.sales += ['SolvedValue ' + str(i)]
+
+        return result
+
+    def init(self, product, params):
+        params.with_greeks = product.with_greeks
+        
+        params.is_mcls = True
+        
+        params.single_FD = True
+        params.fd_calendar = 'DailySchedule'
+        params.underlyingFD_ldp_variable = 'UndlFD'
+        
+        if product.IsAthena:
+            params.payoff_fees_p1_stock = 'Apollon'
+        elif product.IsMemory:
+            params.payoff_fees_p1_stock = 'Phoenix_Plus'
+        else:
+            params.payoff_fees_p1_stock = 'Phoenix'
+        if product.solve_for == 'Cpn' or product.solve_for == 'MemoryCoupon':
+            params.solve_list = (0., 0.025, 0.075, 0.125)
+        elif product.solve_for == 'PdiBarrier':
+            params.solve_list = (0.4, 0.5, 0.6, 0.7, 0.8)
+        params.p1_strike_value_variable = 'StrikePut'
+
+        super().init(product, params)
+
+        params.gaps_coef_ldp_variable = 'CoefGap'
+        params.nominal_in_eur_ldp_variable = 'Nominal'
+        params.underlying_ldp_variable = 'Basket'
+        
+        params.UF = product.Uf if 'Uf' in list(product.keys()) else product.UF
+        params.client_price = product.ClientPrice
+        params.size_option = product.SizeOption
+        params.cnc = product.cnc
+        params.has_vega_t = True
+
+        params.compute_vfm = True
+        params.costs_only = False
